@@ -1,7 +1,7 @@
-using StatsBase, Random, Distributions, DataFrames, Logging, CSV
+using StatsBase, Random, Distributions, DataFrames, Logging, CSV, ProgressBars
 
-@enum INFTYPE SUSC=0 NMA=1 OP=2 ED=3 HOSP=4
-@enum VAXTYPE GSK=1 PFI=2
+@enum INFTYPE SUSC=0 NMA=1 OP=2 ED=3 HOSP=4 ICU=5 MV=6 DEATH=7
+@enum VAXTYPE GSK=1 PFI=2 PFIGSK=3
 @enum VAXMONTH SEP=1 OCT=2
 
 # define an agent and all agent properties
@@ -10,14 +10,10 @@ Base.@kwdef mutable struct Human
     agegroup::Int64 = 0    # in years. don't really need this but left it incase needed later
     comorbidity::Int64 = 0 # 0, 1=(1 - 3 comorbidity), 2=(4+ comorbidity)
     rsvtype::INFTYPE = SUSC # 1 = outpatient, 2 = emergency, 3 = hospital
-    rsvmonth::Int64 = 0  # from months 1 to 9 
-    rsvicu::Bool = false # 
-    rsvmv::Bool = false  # on mechanical ventilator? 
-    rsvdeath::Bool = false 
-    rsvsympdays::Int64 = 0 
-    rsvicudays::Int64 = 0 
+    rsvdays::Dict{String, Float64} = Dict("nma" => 0.0, "symp" => 0.0, "hosp" => 0.0, "icu" => 0.0, "mv" => 0.0)
+    rsvmonth::Int64 = 0 
     vaccinated::Bool = false 
-    vaxmonth::VAXMONTH = SEP  # defauly 
+    vaxmonth::VAXMONTH = SEP  # default
     vaxtype::VAXTYPE = GSK # 1 
     vaxeff_op::Vector{Float64} = zeros(Float64, 9)
     vaxeff_ip::Vector{Float64} = zeros(Float64, 9)
@@ -29,7 +25,7 @@ Base.@kwdef mutable struct ModelParameters    ## use @with_kw from Parameters
     popsize::Int64 = 100000
     numofsims::Int64 = 1000
     usapopulation = 78_913_275
-    vaccine_scenario::Float64 = 0 # 0 - gsk, 1 pfizer 
+    vaccine_scenario::VAXTYPE = GSK # 0 - gsk, 1 pfizer 
     vaccine_coverage::Float64 = 1.0 
 end
 
@@ -46,22 +42,30 @@ function simulations()
    # reset_params() 
     Random.seed!(53)
 
-    names = ["simid", "scenario", "num_gsk", "num_pfi", "total_sick", "nma", "outpatients", "ed", "hosp", "icu", "mv", "sympdays", "hospdays", "icu_mv", "icu_nmv"]
+    # vaccine_scenario
+    p.vaccine_scenario = PFIGSK
+    p.vaccine_coverage = 0.66
+    fname = string(p.vaccine_scenario)
+    fname_coverage = "$(string(p.vaccine_coverage * 100))" # edit these if changing the parameters
+
+    names = ["simid", "scenario", "num_gsk", "num_pfi", "total_sick", "nma", "outpatients", "ed", "totalhosp", "gw", "icu", "mv", "deaths", "nmadays", "sympdays", "hospdays",  "icu_nmv", "icu_mv", "totalqalys", "qalyslost"]
     df_novax = DataFrame([name => [] for name in names])
     df_wivax = DataFrame([name => [] for name in names])
     
-    for i = 1:50
-        @info "simulation $i"
+    for i in ProgressBar(1:1000)
+        #@info "simulation $i"
         initialize() # will return the number of vaccines 
         
         # ORDER OF FUNCTIONS IS IMPORTANT HERE! 
 
         # incidence without vaccine
         incidence()
+        
         _empty_vax = zeros(7, 2) # to be consistent with the with vax dataframe
         _data_incidence = collect_incidence() 
         _data_infdays = collect_days() 
-        _data = hcat(_empty_vax, _data_incidence, _data_infdays)
+        _data_qalys = qalys() 
+        _data = hcat(_empty_vax, _data_incidence, _data_infdays, _data_qalys)
         map(x -> push!(df_novax, (i, "novax", x...)), eachrow(_data))
 
         # what happens with vaccine?
@@ -69,12 +73,13 @@ function simulations()
         _dvax = collect_vaccines()
         _data_incidence = collect_incidence() 
         _data_infdays = collect_days() 
-        _data = hcat(_dvax, _data_incidence, _data_infdays)
+        _data_qalys = qalys() 
+        _data = hcat(_dvax, _data_incidence, _data_infdays, _data_qalys)
         map(x -> push!(df_wivax, (i, "wivax", x...)), eachrow(_data))
 
     end
-    CSV.write("no_vaccine.csv", df_novax)
-    CSV.write("wi_vaccine.csv", df_novax)
+    CSV.write("$(fname)_$(fname_coverage)_novaccine.csv", df_novax)
+    CSV.write("$(fname)_$(fname_coverage)_wivaccine.csv", df_wivax)
 
     df_novax, df_wivax
 end
@@ -120,23 +125,33 @@ function roll_vaccine(month, efficacy)
 end
 
 function apply_vaccine(x::Human, mth::VAXMONTH) 
-    gsk_outpatient = [0.866, 0.853, 0.839, 0.826, 0.813, 0.800, 0.786, 0.773, 0.760]
-    gsk_inpatient = [0.998, 0.979, 0.960, 0.941, 0.922, 0.903, 0.884, 0.865, 0.846]
-    pfi_outpatient = [0.732, 0.705, 0.678, 0.651, 0.624, 0.597, 0.570, 0.543, 0.516]
-    pfi_inpatient = [0.941, 0.923, 0.906, 0.889, 0.872, 0.855, 0.838, 0.820, 0.803]
+    # old numbers: linearly interpolate
+    # gsk_outpatient = [0.866, 0.853, 0.839, 0.826, 0.813, 0.800, 0.786, 0.773, 0.760]
+    # gsk_inpatient = [0.998, 0.979, 0.960, 0.941, 0.922, 0.903, 0.884, 0.865, 0.846]
+    # pfi_outpatient = [0.732, 0.705, 0.678, 0.651, 0.624, 0.597, 0.570, 0.543, 0.516]
+    # pfi_inpatient = [0.941, 0.923, 0.906, 0.889, 0.872, 0.855, 0.838, 0.820, 0.803]
+    gsk_outpatient = [0.825, 0.824, 0.823, 0.822, 0.82, 0.816, 0.812, 0.805, 0.795]#, 0.78, 0.759, 0.729]
+    gsk_inpatient = [0.936, 0.934, 0.931, 0.927, 0.922, 0.914, 0.904, 0.891, 0.873]#, 0.849, 0.818, 0.778]
+    pfi_outpatient = [0.65, 0.649, 0.649, 0.647, 0.646, 0.643, 0.638, 0.632, 0.622]#, 0.607, 0.585, 0.555]
+    pfi_inpatient = [0.889, 0.889, 0.889, 0.889, 0.888, 0.888, 0.887, 0.885, 0.882]#, 0.876, 0.865, 0.845]
 
-    x.vaccinated = true
-    x.vaxmonth = mth
-    vax_select = rand() < p.vaccine_scenario ? :pfi : :gsk
-    if vax_select == :gsk
+    if p.vaccine_scenario == PFIGSK 
+        _st = rand() < 0.5 ? PFI : GSK
+    else 
+        _st = p.vaccine_scenario
+    end 
+    if _st == GSK
+        x.vaccinated = true
         x.vaxtype = GSK
         x.vaxeff_op = roll_vaccine(Int(mth), gsk_outpatient)
         x.vaxeff_ip = roll_vaccine(Int(mth), gsk_inpatient)
-        
-    elseif vax_select == :pfi
+    elseif _st == PFI
+        x.vaccinated = true
         x.vaxtype = PFI
         x.vaxeff_op = roll_vaccine(Int(mth), pfi_outpatient)
         x.vaxeff_ip = roll_vaccine(Int(mth), pfi_inpatient)
+    else 
+        error("unknown vaccine type")
     end
 end
 
@@ -206,7 +221,7 @@ function incidence()
     for i in eachindex(outpatient_months)
         non_sick_humans[i].rsvmonth = outpatient_months[i] 
         non_sick_humans[i].rsvtype = OP
-    end 
+    end
 
     # repeat the same for emergency
     emergency_months = inverse_rle([1, 2, 3, 4, 5, 6, 7, 8, 9],  incidence_per_month[:, 2])
@@ -217,7 +232,6 @@ function incidence()
         non_sick_humans[i].rsvtype = ED
     end
 
-
     # repeat the same for hospitalization (for agents with no comorbidity)
     hospital_months_c1 = inverse_rle([1, 2, 3, 4, 5, 6, 7, 8, 9],  incidence_per_month[:, 3])
     total_hospitals = length(hospital_months_c1)
@@ -227,7 +241,7 @@ function incidence()
         non_sick_humans[i].rsvmonth = hospital_months_c1[i] 
         non_sick_humans[i].rsvtype = HOSP
         if total_icu > 0
-            non_sick_humans[i].rsvicu = true
+            non_sick_humans[i].rsvtype = ICU # overwrite with ICU
             total_icu -= 1
         end
     end
@@ -241,7 +255,7 @@ function incidence()
         non_sick_humans[i].rsvmonth = hospital_months_c2[i] 
         non_sick_humans[i].rsvtype = HOSP
         if total_icu > 0 
-            non_sick_humans[i].rsvicu = true 
+            non_sick_humans[i].rsvtype = ICU # overwrite with ICU
             total_icu -= 1
         end
     end
@@ -255,72 +269,91 @@ function incidence()
         non_sick_humans[i].rsvmonth = hospital_months_c3[i] 
         non_sick_humans[i].rsvtype = HOSP
         if total_icu > 0 
-            non_sick_humans[i].rsvicu = true 
+            non_sick_humans[i].rsvtype = ICU # overwrite with ICU
             total_icu -= 1
         end
     end
 
     # distribute mechanical ventilation to ICU admissions 
-    mv_elg = findall(x -> x.rsvicu == true, humans) 
+    mv_elg = shuffle(findall(x -> x.rsvtype == ICU, humans))
     mv_tot = Int(round(length(mv_elg) * 0.166)) 
     for x in humans[mv_elg[1:mv_tot]] 
-        x.rsvmv = true
+        x.rsvtype = MV
     end 
 
-    # distribute deaths
-    _all_hosp = length(findall(x -> x.rsvtype == HOSP, humans)) 
-    all_hosp = _all_hosp * rand(Uniform(0.056, 0.076))
+    # distribute deaths among hospitalized indivbiduals
+    _all_hosp = length(findall(x -> x.rsvtype in (HOSP, ICU, MV), humans)) 
+    all_hosp = _all_hosp * rand(Uniform(0.056, 0.076)) # 5.6% to 7.6% of all hospitalized patients die
     cnt_death_nonicu, cnt_death_icu = Int.(round.(all_hosp .* [0.37, 0.63])) # hosp rate for ICU and non ICU patients
-    idx_death_nonicu = findall(x -> x.rsvtype == HOSP && x.rsvicu == false, humans)[1:cnt_death_nonicu]
-    idx_death_icu = findall(x -> x.rsvtype == HOSP && x.rsvicu == true, humans)[1:cnt_death_icu]
+    idx_death_nonicu = shuffle(findall(x -> x.rsvtype == HOSP, humans)[1:cnt_death_nonicu])
+    idx_death_icu = shuffle(findall(x -> x.rsvtype in (ICU, MV), humans)[1:cnt_death_icu])
     for i in [idx_death_nonicu..., idx_death_icu...]
-        humans[i].rsvdeath = true
+        humans[i].rsvtype = DEATH
     end
 
+    # add number of days sick to agent object
+    all_sick = findall(x -> Int(x.rsvtype) > 0, humans)
+    for idx in all_sick
+        x = humans[idx]
+        sample_inf_days_human(x)
+    end
 end
 
-function calculate_inf_days(x::Human) 
+function sample_inf_days_human(x::Human) 
+    rsvtype = x.rsvtype
+
+    nmadays = 0 
     sympdays = 0 
     hospdays = 0 
     icu_mv_days = 0 
     icu_nmv_days = 0 
-    if x.rsvtype == NMA 
-        sympdays += rand(Uniform(2, 8)) 
-    elseif x.rsvtype == OP 
+    x.rsvdays["nma"] = nmadays
+    x.rsvdays["symp"] = sympdays
+    x.rsvdays["hosp"] = hospdays
+    x.rsvdays["icu"] = icu_nmv_days
+    x.rsvdays["mv"] = icu_mv_days
+
+    if rsvtype == NMA 
+        nmadays += rand(Uniform(2, 8)) 
+    elseif rsvtype == OP 
         sympdays += rand(Uniform(7, 14))
-    elseif x.rsvtype == ED
+    elseif rsvtype == ED
         sympdays += rand(Uniform(7, 14))
-    elseif x.rsvtype == HOSP
-        sympdays = 4  # 4 days of symptoms before hospital admission
-        if x.rsvicu  
-            hospdays += 1 # one day in the general ward before ICU admission
-            _icu_days = rand(Gamma(1.5625,2.8802))
-            if x.rsvmv 
-                icu_mv_days += _icu_days
-            else 
-                icu_nmv_days += _icu_days
-            end
-        else  # just general ward
-            hospdays += rand(Gamma(1.2258, 5.0582)) # mean 6.2 days
-        end 
-         
-        # if no death, person is GW for 2 more days
-        if !x.rsvdeath 
-            hospdays += 2 
+    elseif rsvtype == HOSP 
+        sympdays += 4  # 4 days of symptoms before hospital admission
+        hospdays += rand(Gamma(1.2258, 5.0582)) # mean 6.2 days
+        hospdays += 2  # since person did not die, 2 days of recovery
+    elseif rsvtype == ICU || rsvtype == MV 
+        sympdays += 4  # 4 days of symptoms before hospital admission
+        hospdays += 1  # one day general ward before ICU 
+        if rsvtype == ICU 
+            icu_nmv_days += rand(Gamma(1.5625,2.8802))
+        else 
+            icu_mv_days += rand(Gamma(1.5625,2.8802)) 
         end
+        hospdays += 2  # since person did not die 
     end
-    return (sympdays, hospdays, icu_mv_days, icu_nmv_days)
+    x.rsvdays["nma"] = nmadays
+    x.rsvdays["symp"] = sympdays
+    x.rsvdays["hosp"] = hospdays
+    x.rsvdays["icu"] = icu_nmv_days
+    x.rsvdays["mv"] = icu_mv_days
+    return (nmadays, sympdays, hospdays, icu_nmv_days, icu_mv_days)
 end
 
 function collect_days() 
-    split_data = zeros(Float64, 7, 4) # 7 rows for all + 6 age groups 
+    split_data = zeros(Float64, 7, 5) # 7 rows for all + 6 age groups 
     all_sick = findall(x -> Int(x.rsvtype) > 0, humans)
     for idx in all_sick
         x = humans[idx]
         ag = x.agegroup
-        s, h, i_mv, i_nmv = calculate_inf_days(x)
-        split_data[1, :] .+= [s, h, i_mv, i_nmv]
-        split_data[ag+1, :] .+= [s, h, i_mv, i_nmv]
+        nma = x.rsvdays["nma"]
+        s = x.rsvdays["symp"]
+        h =  x.rsvdays["hosp"] 
+        i_nmv = x.rsvdays["icu"]
+        i_mv = x.rsvdays["mv"]
+        split_data[1, :] .+= [nma, s, h, i_nmv, i_mv]
+        split_data[ag+1, :] .+= [nma, s, h, i_nmv, i_mv]
     end
     return split_data 
 end
@@ -336,8 +369,12 @@ function collect_vaccines()
 end
 
 function collect_incidence()
-    # check 
-    split_data = zeros(Float64, 7, 7) # 7 rows for all + 6 age groups 
+    # NOTE: HOSP, ICU, MV, DEATH ARE "SPLIT". That is 
+    # technically ICU, MV, DEATH ARE ALL PART OF "HOSPITALIZATION" 
+    # SO TOTAL HOSPITALIZATION REQUIRES SUMMING THEM UP
+    # --> I HAVE ADDED THIS AS A COLUMN `allhospitalizations`
+    
+    split_data = zeros(Float64, 7, 9) # 7 rows for all + 6 age groups 
     for ag in 0:6 
         if ag == 0 
             _humans = humans[findall(x -> Int(x.rsvtype) > 0, humans)]
@@ -349,9 +386,11 @@ function collect_incidence()
         outpatients = length(findall(x -> x.rsvtype == OP, _humans))   
         emergency = length(findall(x -> x.rsvtype == ED, _humans))   
         hosp = length(findall(x -> x.rsvtype == HOSP, _humans))
-        totalicu = length(findall(x -> x.rsvicu == true, _humans))
-        totalmv = length(findall(x -> x.rsvmv == true, _humans))
-        split_data[ag+1, :] .= (all_sick, nma, outpatients, emergency, hosp, totalicu, totalmv)
+        totalicu = length(findall(x -> x.rsvtype == ICU, _humans))
+        totalmv = length(findall(x -> x.rsvtype == MV, _humans))
+        totaldeath = length(findall(x -> x.rsvtype == DEATH, _humans))
+        allhospitalizations = hosp + totalicu + totalmv + totaldeath
+        split_data[ag+1, :] .= (all_sick, nma, outpatients, emergency, allhospitalizations, hosp, totalicu, totalmv, totaldeath)
     end
     return split_data
 end
@@ -366,22 +405,60 @@ function vaccine()
         if x.rsvtype == OP || x.rsvtype == ED  # they become NMA 
             if rn < x.vaxeff_op[x.rsvmonth]
                 x.rsvtype = NMA
-                x.rsvicu = false
-                x.rsvmv = false
-                x.rsvdeath = false
                 op_to_nma += 1
+                sample_inf_days_human(x)
             end
         end 
-        if x.rsvtype == HOSP 
+        if x.rsvtype in (HOSP, ICU, MV, DEATH)
             if rn < x.vaxeff_ip[x.rsvmonth]
                 x.rsvtype = OP
-                x.rsvicu = false
-                x.rsvmv = false
-                x.rsvdeath = false
                 ip_to_op += 1
+                sample_inf_days_human(x)
             end
         end 
     end
     return (op_to_nma, ip_to_op)
 end
 
+function qalys() 
+    split_data = zeros(Float64, 7, 2) 
+
+    wgt_norsv = [0.77, 0.76, 0.74, 0.70, 0.63, 0.51]
+    wgt_nma = [0.6776, 0.6688, 0.6512, 0.6160, 0.5544, 0.4488]
+    wgt_op = [0.5852, 0.5776, 0.5624, 0.532, 0.4788, 0.3876]
+    wgt_nonicu = [0.2695, 0.2660, 0.2590, 0.2450, 0.2205, 0.1785]
+    wgt_icu = [0.077, 0.076, 0.074, 0.070, 0.063, 0.051]
+ 
+    # go througḣall sick but non-dead people 
+    all_sick = findall(x -> Int(x.rsvtype) > 0 && x.rsvtype != DEATH, humans)
+    for i in all_sick
+        x = humans[i]  
+
+        ag = x.agegroup
+
+        nma_days = x.rsvdays["nma"]
+        symp_days = x.rsvdays["symp"]
+        hosp_days =  x.rsvdays["hosp"] 
+        icu_days = x.rsvdays["icu"]
+        mv_days = x.rsvdays["mv"]
+
+        non_rsv_days = 365 - (nma_days + symp_days + hosp_days + icu_days + mv_days)
+        totalqaly = wgt_norsv[ag]*non_rsv_days + wgt_nma[ag]*nma_days + wgt_op[ag]*symp_days + wgt_nonicu[ag]*hosp_days + wgt_icu[ag]*(icu_days + mv_days)
+        totalqaly = totalqaly / 365
+
+        split_data[ag+1, 1] += totalqaly
+    end
+    split_data[1, 1] = sum(split_data[2:end, 1])  # sum up the qalys for each age group for the top row 
+    
+    all_dead = findall(x -> x.rsvtype == DEATH, humans) 
+    wgt_qalylost = [9.47, 7.79, 5.93, 4.49, 2.97, 1.49]
+    for i in all_dead
+        x = humans[i] 
+        ag = x.agegroup
+        qalylost = wgt_qalylost[ag]
+        split_data[ag+1, 2] += qalylost
+    end
+    split_data[1, 2] = sum(split_data[2:end, 2])  # sum up the qalys for each age group for the top row
+
+    return split_data
+end
