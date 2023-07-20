@@ -43,8 +43,8 @@ function simulations()
     Random.seed!(53)
 
     # vaccine_scenario
-    p.vaccine_scenario = PFIGSK
-    p.vaccine_coverage = 0.66
+    p.vaccine_scenario = GSK
+    p.vaccine_coverage = 1.0
     fname = string(p.vaccine_scenario)
     fname_coverage = "$(string(p.vaccine_coverage * 100))" # edit these if changing the parameters
 
@@ -52,7 +52,7 @@ function simulations()
     df_novax = DataFrame([name => [] for name in names])
     df_wivax = DataFrame([name => [] for name in names])
     
-    for i in ProgressBar(1:1000)
+    for i in ProgressBar(1:100)
         #@info "simulation $i"
         initialize() # will return the number of vaccines 
         
@@ -130,10 +130,10 @@ function apply_vaccine(x::Human, mth::VAXMONTH)
     # gsk_inpatient = [0.998, 0.979, 0.960, 0.941, 0.922, 0.903, 0.884, 0.865, 0.846]
     # pfi_outpatient = [0.732, 0.705, 0.678, 0.651, 0.624, 0.597, 0.570, 0.543, 0.516]
     # pfi_inpatient = [0.941, 0.923, 0.906, 0.889, 0.872, 0.855, 0.838, 0.820, 0.803]
-    gsk_outpatient = [0.825, 0.824, 0.823, 0.822, 0.82, 0.816, 0.812, 0.805, 0.795]#, 0.78, 0.759, 0.729]
-    gsk_inpatient = [0.936, 0.934, 0.931, 0.927, 0.922, 0.914, 0.904, 0.891, 0.873]#, 0.849, 0.818, 0.778]
-    pfi_outpatient = [0.65, 0.649, 0.649, 0.647, 0.646, 0.643, 0.638, 0.632, 0.622]#, 0.607, 0.585, 0.555]
-    pfi_inpatient = [0.889, 0.889, 0.889, 0.889, 0.888, 0.888, 0.887, 0.885, 0.882]#, 0.876, 0.865, 0.845]
+    gsk_outpatient = [0.82, 0.82, 0.82, 0.82, 0.82, 0.82, 0.81, 0.80, 0.79]
+    gsk_inpatient = [0.94, 0.93, 0.93, 0.93, 0.92, 0.91, 0.90, 0.89, 0.87]
+    pfi_outpatient = [0.65, 0.65, 0.64, 0.64, 0.63, 0.62, 0.61, 0.60, 0.58]
+    pfi_inpatient = [0.89, 0.89, 0.88, 0.88, 0.88, 0.88, 0.87, 0.86, 0.85]
 
     if p.vaccine_scenario == PFIGSK 
         _st = rand() < 0.5 ? PFI : GSK
@@ -199,6 +199,38 @@ function initialize()
     return (num_vax_gsk, num_vax_pfi)
 end
 
+function _incidence_hospital(hosp_by_month::AbstractArray, comorbid_category) 
+    hosp_age_distr = [0.062, 0.126, 0.265, 0.548]
+
+    # repeat the same for hospitalization (for agents with no comorbidity)
+    total_hosp = sum(hosp_by_month)  # total hospitalization (found by summing over the 9 months)
+    hosp_by_age = round.(Int, hosp_age_distr .* total_hosp) # split the total hospitalization into 4 agegroups
+    hosp_by_age[1] = hosp_by_age[1] + (total_hosp - sum(hosp_by_age)) # if off by 1, add the difference to the first age group 
+    @assert sum(hosp_by_age) == total_hosp # sanity check
+    
+    percent_icu_cormobid = [0.24, 0.15, 0.12]
+    picu = percent_icu_cormobid[comorbid_category+1] # since arg is 0 based
+    total_icu = Int(round(total_hosp * picu))
+
+    h_ag1 = findall(x -> x.agegroup == 1 && x.rsvtype == SUSC && x.comorbidity == comorbid_category, humans)[1:hosp_by_age[1]]
+    h_ag2 = findall(x -> x.agegroup in (2, 3) && x.rsvtype == SUSC && x.comorbidity == comorbid_category, humans)[1:hosp_by_age[2]]
+    h_ag3 = findall(x -> x.agegroup in (4, 5) && x.rsvtype == SUSC && x.comorbidity == comorbid_category, humans)[1:hosp_by_age[3]]
+    h_ag4 = findall(x -> x.agegroup == 6 && x.rsvtype == SUSC && x.comorbidity == comorbid_category, humans)[1:hosp_by_age[4]]
+    h_ag = [h_ag1..., h_ag2..., h_ag3..., h_ag4...]
+    
+    hospital_months_c2 = inverse_rle([1, 2, 3, 4, 5, 6, 7, 8, 9],  hosp_by_month)
+
+    for x in h_ag
+        humans[x].rsvmonth = pop!(hospital_months_c2)
+        humans[x].rsvtype = HOSP
+        if total_icu > 0 
+            humans[x].rsvtype = ICU # overwrite with ICU
+            total_icu -= 1
+        end
+    end
+
+end
+
 function incidence() 
     # sample the annual incidence 
     inc_outpatient = rand(Uniform(1595, 2669))
@@ -232,48 +264,11 @@ function incidence()
         non_sick_humans[i].rsvtype = ED
     end
 
-    # repeat the same for hospitalization (for agents with no comorbidity)
-    hospital_months_c1 = inverse_rle([1, 2, 3, 4, 5, 6, 7, 8, 9],  incidence_per_month[:, 3])
-    total_hospitals = length(hospital_months_c1)
-    total_icu = Int(round(total_hospitals * 0.24))
-    non_sick_humans = humans[findall(x -> x.rsvmonth == 0 && x.comorbidity == 0, humans)[1:total_hospitals]] # don't need to sample here since the `initialize` function already shuffled the population
-    for i in eachindex(hospital_months_c1)
-        non_sick_humans[i].rsvmonth = hospital_months_c1[i] 
-        non_sick_humans[i].rsvtype = HOSP
-        if total_icu > 0
-            non_sick_humans[i].rsvtype = ICU # overwrite with ICU
-            total_icu -= 1
-        end
-    end
-
-    # repeat the same for hospitalization (for agents with 1-3 comorbidity)
-    hospital_months_c2 = inverse_rle([1, 2, 3, 4, 5, 6, 7, 8, 9],  incidence_per_month[:, 4])
-    total_hospitals = length(hospital_months_c2)
-    total_icu = Int(round(total_hospitals * 0.15))
-    non_sick_humans = humans[findall(x -> x.rsvmonth == 0 && x.comorbidity == 1, humans)[1:total_hospitals]] # don't need to sample here since the `initialize` function already shuffled the population
-    for i in eachindex(hospital_months_c2)
-        non_sick_humans[i].rsvmonth = hospital_months_c2[i] 
-        non_sick_humans[i].rsvtype = HOSP
-        if total_icu > 0 
-            non_sick_humans[i].rsvtype = ICU # overwrite with ICU
-            total_icu -= 1
-        end
-    end
-
-    # repeat the same for hospitalization (for agents with 4+ comorbidity)
-    hospital_months_c3 = inverse_rle([1, 2, 3, 4, 5, 6, 7, 8, 9],  incidence_per_month[:, 5])
-    total_hospitals = length(hospital_months_c3)
-    total_icu = Int(round(total_hospitals * 0.12))
-    non_sick_humans = humans[findall(x -> x.rsvmonth == 0 && x.comorbidity == 2, humans)[1:total_hospitals]] # don't need to sample here since the `initialize` function already shuffled the population
-    for i in eachindex(hospital_months_c3)
-        non_sick_humans[i].rsvmonth = hospital_months_c3[i] 
-        non_sick_humans[i].rsvtype = HOSP
-        if total_icu > 0 
-            non_sick_humans[i].rsvtype = ICU # overwrite with ICU
-            total_icu -= 1
-        end
-    end
-
+    #  hospitalization
+    _incidence_hospital(incidence_per_month[:, 3], 0) # 0 no comorbidity
+    _incidence_hospital(incidence_per_month[:, 4], 1) # 1: 1 - 3 comorbidities
+    _incidence_hospital(incidence_per_month[:, 5], 2) # 
+  
     # distribute mechanical ventilation to ICU admissions 
     mv_elg = shuffle(findall(x -> x.rsvtype == ICU, humans))
     mv_tot = Int(round(length(mv_elg) * 0.166)) 
@@ -285,8 +280,8 @@ function incidence()
     _all_hosp = length(findall(x -> x.rsvtype in (HOSP, ICU, MV), humans)) 
     all_hosp = _all_hosp * rand(Uniform(0.056, 0.076)) # 5.6% to 7.6% of all hospitalized patients die
     cnt_death_nonicu, cnt_death_icu = Int.(round.(all_hosp .* [0.37, 0.63])) # hosp rate for ICU and non ICU patients
-    idx_death_nonicu = shuffle(findall(x -> x.rsvtype == HOSP, humans)[1:cnt_death_nonicu])
-    idx_death_icu = shuffle(findall(x -> x.rsvtype in (ICU, MV), humans)[1:cnt_death_icu])
+    idx_death_nonicu = shuffle(findall(x -> x.rsvtype == HOSP, humans))[1:cnt_death_nonicu]
+    idx_death_icu = shuffle(findall(x -> x.rsvtype in (ICU, MV), humans))[1:cnt_death_icu]
     for i in [idx_death_nonicu..., idx_death_icu...]
         humans[i].rsvtype = DEATH
     end
