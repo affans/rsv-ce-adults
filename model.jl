@@ -15,8 +15,8 @@ Base.@kwdef mutable struct Human
     vaccinated::Bool = false 
     vaxmonth::VAXMONTH = SEP  # default
     vaxtype::VAXTYPE = GSK # 1 
-    vaxeff_op::Vector{Float64} = zeros(Float64, 9)
-    vaxeff_ip::Vector{Float64} = zeros(Float64, 9)
+    vaxeff_op::Vector{Float64} = zeros(Float64, 24)
+    vaxeff_ip::Vector{Float64} = zeros(Float64, 24)
 end
 Base.show(io::IO, ::MIME"text/plain", z::Human) = dump(z)
 
@@ -28,6 +28,7 @@ Base.@kwdef mutable struct ModelParameters    ## use @with_kw from Parameters
     vaccine_scenario::VAXTYPE = GSK # 0 - gsk, 1 pfizer 
     vaccine_coverage::Float64 = 1.0 
     incidence_mth_distribution::Vector{Float64} = [0.0017, 0.0165, 0.0449, 0.1649, 0.3047, 0.2365, 0.1660, 0.0591, 0.0057]
+    current_season::Int64 = 1 # either running 1 season or 2 seasons 
 end
 
 # constant variables
@@ -55,14 +56,18 @@ function simulations()
     
     for i in ProgressBar(1:1000)
         #@info "simulation $i"
-        initialize() # will return the number of vaccines 
-        
-        # ORDER OF FUNCTIONS IS IMPORTANT HERE! 
+        initialize() # initialize the population plus assign vaccine efficacy
+    
+        p.current_season = 1 # set the default season 
 
-        # incidence without vaccine
-        incidence()
-        hosp_and_icu()
-        sample_days()
+        # without vaccine scenarios 
+        for ssn in (1, 2) 
+            p.current_season = ssn
+            op_and_ed()       # incidence
+            hosp_and_icu()    # hospitalization and icu  
+        end
+        death()
+        sample_days()     # sample the days spent in each infection category 
         
         _empty_vax = zeros(7, 2) # to be consistent with the with vax dataframe
         _data_incidence = collect_incidence() 
@@ -129,15 +134,29 @@ end
 
 function apply_vaccine(x::Human, mth::VAXMONTH) 
     # old numbers: linearly interpolate
+    
     #gsk_outpatient = [0.82, 0.82, 0.82, 0.82, 0.82, 0.82, 0.81, 0.80, 0.79]
     #gsk_inpatient = [0.94, 0.93, 0.93, 0.93, 0.92, 0.91, 0.90, 0.89, 0.87]
     #pfi_outpatient = [0.65, 0.65, 0.64, 0.64, 0.63, 0.62, 0.61, 0.60, 0.58]
     #pfi_inpatient = [0.89, 0.89, 0.88, 0.88, 0.88, 0.88, 0.87, 0.86, 0.85]
-    gsk_outpatient = [0.826, 0.826, 0.826, 0.826, 0.826, 0.826, 0.826, 0.797, 0.768]
-    gsk_inpatient = [0.941, 0.941, 0.941, 0.941, 0.941, 0.941, 0.941, 0.912, 0.883]
-    pfi_outpatient = [0.651, 0.651, 0.651, 0.651, 0.651, 0.651, 0.651, 0.651, 0.619]
-    pfi_inpatient = [0.889, 0.889, 0.889, 0.889, 0.889, 0.889, 0.889, 0.889, 0.868]
     
+    #gsk_outpatient = [0.826, 0.826, 0.826, 0.826, 0.826, 0.826, 0.826, 0.797, 0.768]
+    #gsk_inpatient = [0.941, 0.941, 0.941, 0.941, 0.941, 0.941, 0.941, 0.912, 0.883]
+    #pfi_outpatient = [0.651, 0.651, 0.651, 0.651, 0.651, 0.651, 0.651, 0.651, 0.619]
+    #pfi_inpatient = [0.889, 0.889, 0.889, 0.889, 0.889, 0.889, 0.889, 0.889, 0.868]
+
+    # FIXED VE
+    #gsk_outpatient = [0.826, 0.826, 0.826, 0.826, 0.826, 0.826, 0.826, 0.797, 0.768, 0.739, 0.710, 0.681, 0.672, 0.672, 0.672, 0.672, 0.672, 0.672, 0.560, 0.448, 0.336, 0.224, 0.112, 0.000]
+    #gsk_inpatient = [0.941, 0.941, 0.941, 0.941, 0.941, 0.941, 0.941, 0.912, 0.883, 0.854, 0.826, 0.797, 0.788, 0.788, 0.788, 0.788, 0.788, 0.788, 0.657, 0.525, 0.394, 0.263, 0.131, 0.000]
+    #pfi_outpatient = [0.651, 0.651, 0.651, 0.651, 0.651, 0.651, 0.651, 0.651, 0.619, 0.586, 0.554, 0.521, 0.489, 0.489, 0.489, 0.489, 0.489, 0.489, 0.408, 0.326, 0.245, 0.163, 0.082, 0.000]
+    #pfi_inpatient = [0.889, 0.889, 0.889, 0.889, 0.889, 0.889, 0.889, 0.889, 0.868, 0.848, 0.827, 0.786, 0.786, 0.786, 0.786, 0.786, 0.786, 0.786, 0.655, 0.524, 0.393, 0.262, 0.131, 0.000]
+
+    # VE
+    gsk_outpatient = [0.82, 0.82, 0.82, 0.82, 0.82, 0.82, 0.81, 0.80, 0.79, 0.78, 0.76, 0.73, 0.69, 0.64, 0.57, 0.49, 0.40, 0.32, 0.23, 0.16, 0.10, 0.06, 0.03, 0.00]
+    gsk_inpatient = [0.94, 0.93, 0.93, 0.93, 0.92, 0.91, 0.90, 0.89, 0.87, 0.85, 0.82, 0.78, 0.73, 0.67, 0.60, 0.52, 0.44, 0.35, 0.27, 0.20, 0.13, 0.08, 0.04, 0.00]
+    pfi_outpatient = [0.65, 0.65, 0.64, 0.64, 0.63, 0.62, 0.61, 0.60, 0.58, 0.56, 0.54, 0.51, 0.47, 0.44, 0.39, 0.35, 0.30, 0.25, 0.20, 0.16, 0.11, 0.07, 0.04, 0.01]
+    pfi_inpatient = [0.89, 0.89, 0.88, 0.88, 0.88, 0.88, 0.87, 0.86, 0.85, 0.84, 0.82, 0.79, 0.75, 0.70, 0.64, 0.56, 0.48, 0.39, 0.30, 0.22, 0.15, 0.09, 0.04, 0.00]
+
     if p.vaccine_scenario == PFIGSK 
         _st = rand() < 0.5 ? PFI : GSK
     else 
@@ -202,6 +221,12 @@ function initialize()
     return (num_vax_gsk, num_vax_pfi)
 end
 
+function mth_indices() 
+    # either returns [1, 2, 3, 4, 5, 6, 7, 8, 9] 
+    # or [13, 14, 15, 16, 17, 18, 19, 20, 21]
+    month_indices = [1, 2, 3, 4, 5, 6, 7, 8, 9] .+ (12 * (p.current_season - 1))
+end
+
 function hosp_and_icu()
     hosp_age_distr = [0.062, 0.126, 0.265, 0.548] # distribution of hospitalization by agegroups 1, (2,3), (4,5), and 6
     hosp_comorbid_distr = [0.055, 0.782, 0.163] # distribution over comorbidity (0 = 0 comorbidity, 1 = 1-3 comorbidity, 2 = 2 comorbidity) 
@@ -236,7 +261,7 @@ function hosp_and_icu()
 
         # take the hosp_by_month (which are counts over months) and is gauranteed to add to the same as hosp_by_age
         # and create a vector with the month of infections totaling this count of hosp_by_month
-        hospital_months_c2 = inverse_rle([1, 2, 3, 4, 5, 6, 7, 8, 9],  hosp_by_month)
+        hospital_months_c2 = inverse_rle(mth_indices(),  hosp_by_month)
 
         # go through each agent (the exact count that needs to be hospitalized)   
         # assign them the right type, the month, and check whether they will be in the icu
@@ -254,6 +279,11 @@ function hosp_and_icu()
         end        
     end
 
+  
+    return sum(inc_hospital)
+end
+
+function death() 
     # DEATH LOGIC 
     death_prob = rand(Uniform(0.056, 0.076))  # 1. sample death probability from uniform distribution 
     all_hospitalized = findall(x -> x.rsvtype in (HOSP, ICU, MV), humans) # 2. find all hospitalized (gw, icu, mv)
@@ -262,7 +292,7 @@ function hosp_and_icu()
     # now need to split all those deaths by age groups (age group probs add to 1) 
     death_prob_by_age = [0.26, 0.22, 0.17, 0.35] # 60-69, 70-79, 80-84, 85+]
     total_death_by_agegroup = round.(Int, total_death_count * death_prob_by_age) # this is a 4 element vector where each element corresponds to death in each age group
-    
+
     # split the total deaths in age groups to hosp/icu (37% of all deaths are in the hosp, 63% in icu/mv)
     deaths_in_hosp = round.(Int, total_death_by_agegroup .* 0.37) # 4 element vector 
     deaths_in_icu = round.(Int, total_death_by_agegroup .* 0.63)  # 4 element vector
@@ -286,7 +316,7 @@ function hosp_and_icu()
         # now that the deaths per age group are adjusted to be maximum the the number of people in each age group, we can kill them
         push!(idx_to_die, pool[i][1:deaths_in_hosp[i]]...)
     end
-    
+
     pool_icumv_ag1 = shuffle!(findall(x -> x.rsvtype in (ICU, MV) && x.agegroup in (1, 2), humans))
     pool_icumv_ag2 = shuffle!(findall(x -> x.rsvtype in (ICU, MV) && x.agegroup in (3, 4), humans))
     pool_icumv_ag3 = shuffle!(findall(x -> x.rsvtype in (ICU, MV) && x.agegroup == 5, humans))
@@ -299,16 +329,13 @@ function hosp_and_icu()
         end
         push!(idx_to_die, pool_icu[i][1:deaths_in_icu[i]]...)
     end
-    
+
     for x in idx_to_die 
-       humans[x].rsvtype = DEATH # overwrite with DEATH
+        humans[x].rsvtype = DEATH # overwrite with DEATH
     end
-    
-    
-    return 0 
 end
 
-function incidence() 
+function op_and_ed() 
     # sample the annual incidence 
     inc_outpatient = rand(Uniform(1595, 2669))
     inc_emergency = rand(Uniform(23, 387)) 
@@ -324,18 +351,18 @@ function incidence()
     @info "total incidence and (op, ed, hosp(0comorbid), hosp(2-4co), hosp(4+co)): " sum(incidence_per_month) sum(incidence_per_month, dims=1) 
 
     # distribute outpatients to the population
-    outpatient_months = inverse_rle([1, 2, 3, 4, 5, 6, 7, 8, 9],  incidence_per_month[:, 1])
+    outpatient_months = inverse_rle(mth_indices(),  incidence_per_month[:, 1])
     total_outpatients = length(outpatient_months)
-    non_sick_humans = humans[findall(x -> x.rsvmonth == 0, humans)[1:total_outpatients]] # don't need to sample here since the `initialize` function already shuffled the population
+    non_sick_humans = humans[findall(x -> x.rsvtype == SUSC, humans)[1:total_outpatients]] # don't need to sample here since the `initialize` function already shuffled the population
     for i in eachindex(outpatient_months)
         non_sick_humans[i].rsvmonth = outpatient_months[i] 
         non_sick_humans[i].rsvtype = OP
     end
 
     # repeat the same for emergency
-    emergency_months = inverse_rle([1, 2, 3, 4, 5, 6, 7, 8, 9],  incidence_per_month[:, 2])
+    emergency_months = inverse_rle(mth_indices(),  incidence_per_month[:, 2])
     total_emergencies = length(emergency_months)
-    non_sick_humans = humans[findall(x -> x.rsvmonth == 0, humans)[1:total_emergencies]] # don't need to sample here since the `initialize` function already shuffled the population
+    non_sick_humans = humans[findall(x -> x.rsvtype == SUSC, humans)[1:total_emergencies]] # don't need to sample here since the `initialize` function already shuffled the population
     for i in eachindex(emergency_months)
         non_sick_humans[i].rsvmonth = emergency_months[i] 
         non_sick_humans[i].rsvtype = ED
@@ -424,6 +451,15 @@ function collect_days()
         split_data[ag+1, :] .+= [nma, s, h, i_nmv, i_mv]
     end
     return split_data 
+end
+
+function collect_toi() 
+    # function calculates the time of infection for each agent 
+    all_sick = findall(x -> Int(x.rsvtype) > 0, humans)
+    split_data = zeros(Float64, 7, 1)
+
+    toi = [humans[i].rsvmonth for i in all_sick]
+    countmap(toi)
 end
 
 function collect_vaccines() 
