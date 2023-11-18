@@ -1,4 +1,4 @@
-using StatsBase, Random, Distributions, DataFrames, Logging, CSV, ProgressBars
+using StatsBase, Random, Distributions, DataFrames, Logging, CSV, ProgressBars, IterTools
 
 @enum INFTYPE SUSC=0 NMA=1 OP=2 ED=3 HOSP=4 ICU=5 MV=6 DEATH=7
 @enum VAXTYPE GSK=1 PFI=2 PFIGSK=3
@@ -17,6 +17,7 @@ Base.@kwdef mutable struct Human
     vaxtype::VAXTYPE = GSK # 1 
     vaxeff_op::Vector{Float64} = zeros(Float64, 24)
     vaxeff_ip::Vector{Float64} = zeros(Float64, 24)
+    qalyweights::Dict{String, Float64} = Dict("norsv" => 0.0, "nma" => 0.0, "symp" => 0.0, "hosp" => 0.0, "icu" => 0.0, "adverse" => 0.0)
 end
 Base.show(io::IO, ::MIME"text/plain", z::Human) = dump(z)
 
@@ -27,6 +28,7 @@ Base.@kwdef mutable struct ModelParameters    ## use @with_kw from Parameters
     usapopulation = 78_913_275
     vaccine_scenario::VAXTYPE = GSK # 0 - gsk, 1 pfizer 
     vaccine_coverage::Float64 = 1.0 
+    vaccine_profile::String = "fixed"
     incidence_mth_distribution::Vector{Float64} = [0.0017, 0.0165, 0.0449, 0.1649, 0.3047, 0.2365, 0.1660, 0.0591, 0.0057]
     current_season::Int64 = 1 # either running 1 season or 2 seasons 
 end
@@ -36,8 +38,26 @@ const humans = Array{Human}(undef, 0)
 const p = ModelParameters()  ## setup default parameters
 pc(x) = Int(round(x / p.usapopulation * p.popsize)) # convert to per-capita
 
+function scenarios() 
+    profiles = ["fixed", "sigmoidal"]
+    vaccines = [GSK, PFI, PFIGSK]
+    coverages = [0.66, 1.00]
+    
+    for profile in profiles 
+        for vaccine in vaccines 
+            for coverage in coverages 
+                p.vaccine_profile = profile
+                p.vaccine_scenario = vaccine
+                p.vaccine_coverage = coverage
+                simulations()
+            end
+        end
+    end
+end
+
 function simulations()
     # redirect the @info statements
+    length(humans) == 0 && error("run reset_params() first")
     logger = NullLogger()
     global_logger(logger)
 
@@ -45,34 +65,42 @@ function simulations()
     Random.seed!(53)
 
     # vaccine_scenario
-    p.vaccine_scenario = PFIGSK
-    p.vaccine_coverage = 0.66
+    #p.vaccine_profile = "fixed" # or sigmoid
+    #p.vaccine_scenario = GSK
+    #p.vaccine_coverage = 0.66 #1.00
     fname = string(p.vaccine_scenario)
     fname_coverage = "$(string(p.vaccine_coverage * 100))" # edit these if changing the parameters
+    fname_profile = p.vaccine_profile
+    println("simulation: $fname_coverage")
 
     names = ["simid", "scenario", "num_gsk", "num_pfi", "total_sick", "nma", "outpatients", "ed", "totalhosp", "gw", "icu", "mv", "deaths", "nmadays", "sympdays", "hospdays",  "icu_nmv", "icu_mv", "totalqalys", "qalyslost"]
     df_novax = DataFrame([name => [] for name in names])
     df_wivax = DataFrame([name => [] for name in names])
-    
+    println("doing one season")
     for i in ProgressBar(1:1000)
         #@info "simulation $i"
         initialize() # initialize the population plus assign vaccine efficacy
     
-        p.current_season = 1 # set the default season 
-
+        
         # without vaccine scenarios 
-        for ssn in (1, 2) 
-            p.current_season = ssn
-            op_and_ed()       # incidence
-            hosp_and_icu()    # hospitalization and icu  
-        end
+        # for ssn in (1, 2) 
+        #     p.current_season = ssn
+        #     op_and_ed()       # incidence
+        #     hosp_and_icu()    # hospitalization and icu  
+        # end
+        p.current_season = 1 # set the default season 
+        op_and_ed()       # incidence
+        hosp_and_icu()    # hospitalization and icu  
+
+
         death()
         sample_days()     # sample the days spent in each infection category 
+        sample_qalys()    # sample the qaly weights from beta distribution
         
         _empty_vax = zeros(7, 2) # to be consistent with the with vax dataframe
         _data_incidence = collect_incidence() 
         _data_infdays = collect_days() 
-        _data_qalys = qalys() 
+        _data_qalys = qalys2() 
         _data = hcat(_empty_vax, _data_incidence, _data_infdays, _data_qalys)
         map(x -> push!(df_novax, (i, "novax", x...)), eachrow(_data))
 
@@ -81,13 +109,13 @@ function simulations()
         _dvax = collect_vaccines()
         _data_incidence = collect_incidence() 
         _data_infdays = collect_days() 
-        _data_qalys = qalys() 
+        _data_qalys = qalys2() 
         _data = hcat(_dvax, _data_incidence, _data_infdays, _data_qalys)
         map(x -> push!(df_wivax, (i, "wivax", x...)), eachrow(_data))
 
     end
-    CSV.write("$(fname)_$(fname_coverage)_novaccine.csv", df_novax)
-    CSV.write("$(fname)_$(fname_coverage)_wivaccine.csv", df_wivax)
+    CSV.write("$(fname)_$(fname_coverage)_$(fname_profile)_novaccine.csv", df_novax)
+    CSV.write("$(fname)_$(fname_coverage)_$(fname_profile)_wivaccine.csv", df_wivax)
 
     df_novax, df_wivax
 end
@@ -150,12 +178,34 @@ function apply_vaccine(x::Human, mth::VAXMONTH)
     #gsk_inpatient = [0.941, 0.941, 0.941, 0.941, 0.941, 0.941, 0.941, 0.912, 0.883, 0.854, 0.826, 0.797, 0.788, 0.788, 0.788, 0.788, 0.788, 0.788, 0.657, 0.525, 0.394, 0.263, 0.131, 0.000]
     #pfi_outpatient = [0.651, 0.651, 0.651, 0.651, 0.651, 0.651, 0.651, 0.651, 0.619, 0.586, 0.554, 0.521, 0.489, 0.489, 0.489, 0.489, 0.489, 0.489, 0.408, 0.326, 0.245, 0.163, 0.082, 0.000]
     #pfi_inpatient = [0.889, 0.889, 0.889, 0.889, 0.889, 0.889, 0.889, 0.889, 0.868, 0.848, 0.827, 0.786, 0.786, 0.786, 0.786, 0.786, 0.786, 0.786, 0.655, 0.524, 0.393, 0.262, 0.131, 0.000]
-
     # VE
-    gsk_outpatient = [0.82, 0.82, 0.82, 0.82, 0.82, 0.82, 0.81, 0.80, 0.79, 0.78, 0.76, 0.73, 0.69, 0.64, 0.57, 0.49, 0.40, 0.32, 0.23, 0.16, 0.10, 0.06, 0.03, 0.00]
-    gsk_inpatient = [0.94, 0.93, 0.93, 0.93, 0.92, 0.91, 0.90, 0.89, 0.87, 0.85, 0.82, 0.78, 0.73, 0.67, 0.60, 0.52, 0.44, 0.35, 0.27, 0.20, 0.13, 0.08, 0.04, 0.00]
-    pfi_outpatient = [0.65, 0.65, 0.64, 0.64, 0.63, 0.62, 0.61, 0.60, 0.58, 0.56, 0.54, 0.51, 0.47, 0.44, 0.39, 0.35, 0.30, 0.25, 0.20, 0.16, 0.11, 0.07, 0.04, 0.01]
-    pfi_inpatient = [0.89, 0.89, 0.88, 0.88, 0.88, 0.88, 0.87, 0.86, 0.85, 0.84, 0.82, 0.79, 0.75, 0.70, 0.64, 0.56, 0.48, 0.39, 0.30, 0.22, 0.15, 0.09, 0.04, 0.00]
+    #gsk_outpatient = [0.82, 0.82, 0.82, 0.82, 0.82, 0.82, 0.81, 0.80, 0.79, 0.78, 0.76, 0.73, 0.69, 0.64, 0.57, 0.49, 0.40, 0.32, 0.23, 0.16, 0.10, 0.06, 0.03, 0.00]
+    #gsk_inpatient = [0.94, 0.93, 0.93, 0.93, 0.92, 0.91, 0.90, 0.89, 0.87, 0.85, 0.82, 0.78, 0.73, 0.67, 0.60, 0.52, 0.44, 0.35, 0.27, 0.20, 0.13, 0.08, 0.04, 0.00]
+    #pfi_outpatient = [0.65, 0.65, 0.64, 0.64, 0.63, 0.62, 0.61, 0.60, 0.58, 0.56, 0.54, 0.51, 0.47, 0.44, 0.39, 0.35, 0.30, 0.25, 0.20, 0.16, 0.11, 0.07, 0.04, 0.01]
+    #pfi_inpatient = [0.89, 0.89, 0.88, 0.88, 0.88, 0.88, 0.87, 0.86, 0.85, 0.84, 0.82, 0.79, 0.75, 0.70, 0.64, 0.56, 0.48, 0.39, 0.30, 0.22, 0.15, 0.09, 0.04, 0.00]
+
+    # NEW FIXED VE
+    if p.vaccine_profile == "fixed" 
+        gsk_outpatient = [0.826, 0.826, 0.826, 0.826, 0.826, 0.826, 0.826, 0.776, 0.726, 0.676, 0.626, 0.576, 0.561, 0.561, 0.561, 0.561, 0.561, 0.561, 0.468, 0.374, 0.281, 0.187, 0.094, 0.000]
+        gsk_inpatient = [0.941, 0.941, 0.941, 0.941, 0.941, 0.941, 0.941, 0.885, 0.828, 0.772, 0.715, 0.659, 0.624, 0.624, 0.624, 0.624, 0.624, 0.624, 0.535, 0.428, 0.321, 0.214, 0.107, 0.000]
+        pfi_outpatient = [0.651, 0.651, 0.651, 0.651, 0.651, 0.651, 0.651, 0.619, 0.586, 0.554, 0.521, 0.489, 0.488, 0.488, 0.488, 0.488, 0.488, 0.488, 0.408, 0.326, 0.245, 0.163, 0.082, 0.000]
+        pfi_inpatient = [0.889, 0.889, 0.889, 0.889, 0.889, 0.889, 0.889, 0.868, 0.848, 0.827, 0.807, 0.786, 0.786, 0.786, 0.786, 0.786, 0.786, 0.786, 0.655, 0.524, 0.393, 0.262, 0.131, 0.000]
+        
+    else 
+        gsk_outpatient = [0.825, 0.824, 0.823, 0.822, 0.820, 0.816, 0.812, 0.805, 0.795, 0.780, 0.759, 0.729, 0.689, 0.635, 0.569, 0.490, 0.403, 0.315, 0.233, 0.162, 0.104, 0.059, 0.026, 0.000]
+        gsk_inpatient = [0.936, 0.934, 0.931, 0.927, 0.922, 0.914, 0.904, 0.891, 0.873, 0.849, 0.818, 0.778, 0.728, 0.668, 0.598, 0.519, 0.436, 0.352, 0.272, 0.198, 0.135, 0.081, 0.038, 0.000]
+        pfi_outpatient = [0.649, 0.646, 0.642, 0.636, 0.630, 0.621, 0.610, 0.597, 0.580, 0.560, 0.536, 0.507, 0.474, 0.436, 0.393, 0.347, 0.299, 0.250, 0.202, 0.156, 0.113, 0.075, 0.041, 0.000]
+        pfi_inpatient = [0.887, 0.886, 0.885, 0.883, 0.880, 0.876, 0.871, 0.863, 0.852, 0.836, 0.815, 0.787, 0.748, 0.699, 0.638, 0.564, 0.481, 0.393, 0.305, 0.222, 0.149, 0.087, 0.038, 0.000]
+    end
+    
+    # adverse reactions due to vaccine 
+    d1 = Beta(162.61, 48.57)
+    d2 = Beta(141.60, 44.72)
+    d3 = Beta(112.16, 39.41)
+    d4 = Beta(76.03, 32.58)
+    d5 = Beta(41.96, 24.64)
+    d6 = Beta(33.08, 31.78)
+    betas = [d1, d2, d3, d4, d5, d6]
 
     if p.vaccine_scenario == PFIGSK 
         _st = rand() < 0.5 ? PFI : GSK
@@ -163,11 +213,22 @@ function apply_vaccine(x::Human, mth::VAXMONTH)
         _st = p.vaccine_scenario
     end 
     if _st == GSK
+        if rand() < 0.499 
+            adverse_dist = betas[x.agegroup]
+            adverse_weight = rand(adverse_dist) 
+            x.qalyweights["adverse"] = adverse_weight * 0.88
+        end
         x.vaccinated = true
         x.vaxtype = GSK
         x.vaxeff_op = roll_vaccine(Int(mth), gsk_outpatient)
         x.vaxeff_ip = roll_vaccine(Int(mth), gsk_inpatient)
     elseif _st == PFI
+        if rand() < 0.274
+            adverse_dist = betas[x.agegroup]
+            adverse_weight = rand(adverse_dist) 
+            x.qalyweights["adverse"] = adverse_weight * 0.88
+        end
+
         x.vaccinated = true
         x.vaxtype = PFI
         x.vaxeff_op = roll_vaccine(Int(mth), pfi_outpatient)
@@ -197,7 +258,7 @@ function initialize()
         humans[i] = Human() 
         x = humans[i] 
         x.idx = i  
-        x.agegroup = sf_agegroups[i]
+        x.agegroup = sf_agegroups[i] 
         x.comorbidity = rand(co[x.agegroup]) - 1 # since categorical is 1-based. 
     end
 
@@ -285,7 +346,7 @@ end
 
 function death() 
     # DEATH LOGIC 
-    death_prob = rand(Uniform(0.056, 0.076))  # 1. sample death probability from uniform distribution 
+    death_prob = rand(Uniform(0.066, 0.11))  # 1. sample death probability from uniform distribution 
     all_hospitalized = findall(x -> x.rsvtype in (HOSP, ICU, MV), humans) # 2. find all hospitalized (gw, icu, mv)
     total_death_count = round(Int, death_prob * length(all_hospitalized)) # 3. multiply death probability by the number of hospitalized to get a TOTAL NUMBER OF DEATHS 
 
@@ -383,6 +444,7 @@ function sample_days()
     end
 end
 
+
 function sample_inf_days_human(x::Human) 
     rsvtype = x.rsvtype
 
@@ -434,6 +496,44 @@ function sample_inf_days_human(x::Human)
     x.rsvdays["icu"] = icu_nmv_days
     x.rsvdays["mv"] = icu_mv_days
     return (nmadays, sympdays, hospdays, icu_nmv_days, icu_mv_days)
+end
+
+
+
+function sample_qalys() 
+    # sample the QALY weight for each sick agent object
+    all_sick = findall(x -> Int(x.rsvtype) > 0, humans)
+    
+    # sample the NO RSV weight using beta distributions
+    d1 = Beta(162.61, 48.57)
+    d2 = Beta(141.60, 44.72)
+    d3 = Beta(112.16, 39.41)
+    d4 = Beta(76.03, 32.58)
+    d5 = Beta(41.96, 24.64)
+    d6 = Beta(33.08, 31.78)
+    betas = [d1, d2, d3, d4, d5, d6]
+
+    # multiplicative factors for each disease type
+    nonma_wgt = 0.88
+    op_wgt = 0.76 
+    hosp_wgt = 0.35 
+    icu_wgt = 0.1 
+    
+    for idx in all_sick
+        x = humans[idx]
+        ag = x.agegroup 
+        
+        # get the non-rsv distribution
+        nonrsv_dist = betas[ag]
+        norsv_wgt = rand(nonrsv_dist)
+        
+        x.qalyweights["norsv"] = norsv_wgt
+        x.qalyweights["nma"] = norsv_wgt * nonma_wgt
+        x.qalyweights["symp"] = norsv_wgt * op_wgt
+        x.qalyweights["hosp"] = norsv_wgt * hosp_wgt
+        x.qalyweights["icu"] = norsv_wgt * icu_wgt
+    end
+    
 end
 
 function collect_days() 
@@ -548,6 +648,50 @@ function qalys()
 
         non_rsv_days = 365 - (nma_days + symp_days + hosp_days + icu_days + mv_days)
         totalqaly = wgt_norsv[ag]*non_rsv_days + wgt_nma[ag]*nma_days + wgt_op[ag]*symp_days + wgt_nonicu[ag]*hosp_days + wgt_icu[ag]*(icu_days + mv_days)
+        totalqaly = totalqaly / 365
+
+        split_data[ag+1, 1] += totalqaly
+    end
+    split_data[1, 1] = sum(split_data[2:end, 1])  # sum up the qalys for each age group for the top row 
+    
+    all_dead = findall(x -> x.rsvtype == DEATH, humans) 
+    wgt_qalylost = [9.47, 7.79, 5.93, 4.49, 2.97, 1.49]
+    for i in all_dead
+        x = humans[i] 
+        ag = x.agegroup
+        qalylost = wgt_qalylost[ag]
+        split_data[ag+1, 2] += qalylost
+    end
+    split_data[1, 2] = sum(split_data[2:end, 2])  # sum up the qalys for each age group for the top row
+
+    return split_data
+end
+
+function qalys2() 
+    split_data = zeros(Float64, 7, 2) 
+
+    # go througḣall sick but non-dead people 
+    all_sick = findall(x -> Int(x.rsvtype) > 0 && x.rsvtype != DEATH, humans)
+    for i in all_sick
+        x = humans[i]  
+        ag = x.agegroup
+
+        nma_days = x.rsvdays["nma"]
+        symp_days = x.rsvdays["symp"]
+        hosp_days =  x.rsvdays["hosp"] 
+        icu_days = x.rsvdays["icu"]
+        mv_days = x.rsvdays["mv"]
+        adverse_days = 1.5 
+
+        wgt_norsv = x.qalyweights["norsv"] 
+        wgt_nma = x.qalyweights["nma"] 
+        wgt_op = x.qalyweights["symp"]
+        wgt_nonicu = x.qalyweights["hosp"]
+        wgt_icu = x.qalyweights["icu"] 
+        wgt_adverse = x.qalyweights["adverse"]
+
+        non_rsv_days = 365 - (nma_days + symp_days + hosp_days + icu_days + mv_days + adverse_days)
+        totalqaly = wgt_norsv*non_rsv_days + wgt_nma*nma_days + wgt_op*symp_days + wgt_nonicu*hosp_days + wgt_icu*(icu_days + mv_days) + wgt_adverse*adverse_days
         totalqaly = totalqaly / 365
 
         split_data[ag+1, 1] += totalqaly
